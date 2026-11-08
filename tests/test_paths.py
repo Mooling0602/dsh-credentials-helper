@@ -1,8 +1,9 @@
-"""Tests for the harness home and document location resolution."""
+"""Tests for the resource paths the plugin resolves."""
 
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -32,9 +33,7 @@ class HomeResolutionTests(unittest.TestCase):
 
     def test_the_install_layout_derives_the_home(self):
         directory = Path(tempfile.mkdtemp(prefix="cred-paths-"))
-        self.addCleanup(
-            lambda: __import__("shutil").rmtree(directory, ignore_errors=True)
-        )
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
         install = directory / ".dsh" / "profiles" / "web" / "mloader" / "plugins"
         module = (
             install / "dsh-credentials-helper" / "dsh_credentials_helper" / "paths.py"

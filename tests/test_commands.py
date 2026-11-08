@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import os
-import tempfile
 import unittest
 from pathlib import Path
+
+from support import TemporaryDocumentTest
 
 from dsh_credentials_helper.commands import CredentialCommandHandler
 from dsh_credentials_helper.credentials import CredentialsStore
 
-DOCUMENT = """version: 2
+DOCUMENT = """version: 1
 refs:
   ALPHA: old-alpha-secret
   BETA: 'beta-old'
@@ -30,16 +30,10 @@ class RecordingLogger:
         self.errors.append((message, data))
 
 
-class CommandTests(unittest.TestCase):
+class CommandTests(TemporaryDocumentTest):
     def setUp(self):
-        directory = Path(tempfile.mkdtemp(prefix="cred-command-"))
-        self.addCleanup(
-            lambda: __import__("shutil").rmtree(directory, ignore_errors=True)
-        )
-        self.directory = directory
-        self.path = directory / ".credentials.yaml"
-        self.path.write_text(DOCUMENT, encoding="utf-8")
-        os.chmod(self.path, 0o600)
+        super().setUp()
+        self.write_document(DOCUMENT)
         self.logger = RecordingLogger()
         self.handler = CredentialCommandHandler(
             CredentialsStore(self.path), self.logger
@@ -49,7 +43,7 @@ class CommandTests(unittest.TestCase):
         return self.handler.handle(line)
 
     def file_text(self):
-        return self.path.read_text(encoding="utf-8")
+        return self.read_document()
 
     def test_usage_and_help(self):
         for line in [
@@ -67,6 +61,7 @@ class CommandTests(unittest.TestCase):
         help_result = self.run_command("help")
         self.assertEqual(help_result["kind"], "success")
         self.assertIn("/cred set", help_result["text"])
+        self.assertIn("/cred help", help_result["text"])
 
     def test_unknown_options_are_refused(self):
         result = self.run_command("set ALPHA value --bogus")
@@ -87,6 +82,7 @@ class CommandTests(unittest.TestCase):
         result = self.run_command("set ALPHA new-alpha-secret")
         self.assertEqual(result["kind"], "success")
         self.assertIn("confirmation required", result["text"])
+        self.assertIn("new-...cret", result["text"])
         self.assertNotIn("new-alpha-secret", result["text"])
         self.assertNotIn("old-alpha-secret", result["text"])
         self.assertEqual(self.file_text(), before)
@@ -164,12 +160,40 @@ class CommandTests(unittest.TestCase):
         result = self.run_command('set ALPHA ""')
         self.assertEqual(result["kind"], "error")
 
-    def test_a_missing_file_errors_before_the_confirmation_step(self):
-        self.path.unlink()
-        result = self.run_command("set ALPHA new-value")
+    def test_a_value_starting_with_two_dashes_needs_the_end_of_options(self):
+        result = self.run_command("set ALPHA --weird-value")
         self.assertEqual(result["kind"], "error")
-        self.assertIn("not found", result["text"])
-        self.assertEqual(self.run_command("ok")["kind"], "error")
+        self.assertIn("unknown option", result["text"])
+        staged = self.run_command("set ALPHA -- --weird-value")
+        self.assertIn("confirmation required", staged["text"])
+        self.assertIn('ALPHA: "--weird-value"', self.file_text()) if False else None
+        self.assertNotIn("--weird-value", self.file_text())
+        written = self.run_command("ok")
+        self.assertEqual(written["kind"], "success")
+        self.assertIn('ALPHA: "--weird-value"', self.file_text())
+        self.assertEqual(self.run_command("read ALPHA")["text"], "--weird-value\n")
+
+    def test_a_value_starting_with_one_dash_needs_no_escape(self):
+        result = self.run_command("set ALPHA -dash-value --skip-confirm")
+        self.assertEqual(result["kind"], "success")
+        self.assertIn('ALPHA: "-dash-value"', self.file_text())
+
+    def test_a_missing_file_is_created_after_confirmation(self):
+        self.path.unlink()
+        staged = self.run_command("set ALPHA new-value")
+        self.assertEqual(staged["kind"], "success")
+        self.assertIn("current: (not set)", staged["text"])
+        self.assertFalse(self.path.exists())
+        written = self.run_command("ok")
+        self.assertEqual(written["kind"], "success")
+        self.assertEqual(self.file_text(), 'version: 1\nrefs:\n  ALPHA: "new-value"\n')
+
+    def test_a_document_without_refs_gets_the_section_on_write(self):
+        self.write_document("version: 1\nrecords:\n  scope/id:\n    kind: grant\n")
+        self.run_command("set ALPHA new-value")
+        result = self.run_command("ok")
+        self.assertEqual(result["kind"], "success")
+        self.assertIn('refs:\n  ALPHA: "new-value"\nrecords:', self.file_text())
 
     def test_an_unexpected_error_stays_opaque(self):
         class ExplodingStore:

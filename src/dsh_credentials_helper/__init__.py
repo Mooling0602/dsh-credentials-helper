@@ -10,18 +10,21 @@ from .credentials import (
     CredentialsError,
     CredentialsStore,
     DocumentChanged,
+    DocumentNotFound,
     ReferenceNotFound,
     validate_reference_name,
 )
-from .paths import resolve_credentials_path, resolve_dsh_home
+from .paths import CredentialsPathError, resolve_credentials_path, resolve_dsh_home
 
 __all__ = [
     "COMMAND_NAME",
     "USAGE",
     "CredentialCommandHandler",
     "CredentialsError",
+    "CredentialsPathError",
     "CredentialsStore",
     "DocumentChanged",
+    "DocumentNotFound",
     "ReferenceNotFound",
     "resolve_credentials_path",
     "resolve_dsh_home",

@@ -11,13 +11,18 @@ from __future__ import annotations
 
 from dsh_mloader_sdk import Context, plugin
 
-from dsh_credentials_helper.commands import CredentialCommandHandler
+from dsh_credentials_helper.commands import COMMAND_NAME, CredentialCommandHandler
 from dsh_credentials_helper.credentials import CredentialsStore
 
 
 @plugin
 def apply(ctx: Context) -> None:
     """Register the /cred command node.
+
+    The node asks for two candidate names because the host hands out the
+    first one that is still free. A taken name leaves the node
+    registered under the fallback instead of silently unmounting the
+    plugin.
 
     :param ctx: Capability context handed to the plugin.
     :type ctx: Context
@@ -27,7 +32,8 @@ def apply(ctx: Context) -> None:
     handler = CredentialCommandHandler(CredentialsStore(), ctx.logger)
 
     @ctx.commands.register(
-        names="cred",
+        names=(COMMAND_NAME, "credentials"),
+        node_id=COMMAND_NAME,
         description="Read a credential reference, or update one with a confirmation step.",
         input_hint="set <KEY> <VALUE> [--skip-confirm] | read <KEY> | ok",
     )
@@ -42,4 +48,4 @@ def apply(ctx: Context) -> None:
         """
         return handler.handle(raw_input)
 
-    ctx.logger.info("dsh-credentials-helper mounted; /cred is available")
+    ctx.logger.info("dsh-credentials-helper mounted; requested the /cred command node")

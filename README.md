@@ -4,7 +4,7 @@ English | [简体中文](README.zh.md)
 
 A [dsh-mloader](https://github.com/Mooling0602/dsh-mloader) Python plugin that exposes the DeepSeek Harness credential references through one human-facing slash command. It registers no tool, so the model cannot read or write the credential document through this plugin.
 
-The plugin works on `<DSH_HOME>/.credentials.yaml`, the file the Harness credentials provider owns. It reads the `refs` mapping and can replace one value or add one entry. Writes are staged behind a confirmation step, the file stays owner-only, and the document is replaced atomically.
+The plugin works on `<DSH_HOME>/.credentials.yaml`, the file the Harness credentials provider owns. It reads the `refs` mapping and can replace one value or add one entry. Writes are staged behind a confirmation step, the file stays owner-only, and the document is replaced atomically under the same writer lock the Harness uses. A document that has no `refs` section, or has the empty inline form the writer leaves after the last reference is deleted, is completed with a block mapping on the first write.
 
 [![dsh-mloader-badge](https://img.shields.io/badge/powered_by-dsh--mloader-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/Mooling0602/dsh-mloader)
 [![license-mit-badge](https://img.shields.io/github/license/Mooling0602/dsh-credentials-helper?style=flat-square)](https://github.com/Mooling0602/dsh-credentials-helper/blob/main/LICENSE)
@@ -24,7 +24,7 @@ mkdir -p <DSH_HOME>/profiles/<profile>/mloader/plugins
 cp -r src <DSH_HOME>/profiles/<profile>/mloader/plugins/dsh-credentials-helper
 ```
 
-The loader watches the plugin root and mounts the directory. When watching is disabled, load it with `/mloader load dsh-credentials-helper`. To install it as a package instead, build an archive from the same directory and hand it to the runtime command line or the loader install command:
+The loader watches the plugin root and mounts the directory. When watching is disabled, load it with `/mloader load dsh-credentials-helper`. The command asks for the name `/cred` and falls back to `/credentials` when another plugin already owns the first name. To install it as a package instead, build an archive from the same directory and hand it to the runtime command line or the loader install command:
 
 ```sh
 python3 <dsh-mloader>/src/runtime/python_sdk/run_cli.py pack src -o dist/dsh-credentials-helper.mloader.pack
@@ -37,11 +37,12 @@ python3 <dsh-mloader>/src/runtime/python_sdk/run_cli.py pack src -o dist/dsh-cre
 | --- | --- |
 | `/cred set <KEY> <VALUE>` | Stage an update to the reference `KEY` and ask for confirmation. |
 | `/cred set <KEY> <VALUE> --skip-confirm` | Write the update immediately. |
+| `/cred set <KEY> -- <VALUE>` | Stage one update whose value starts with `--`. |
 | `/cred read <KEY>` | Print the decoded value of `KEY`. |
 | `/cred ok` or `/cred confirm` | Write the update that is waiting for confirmation. |
 | `/cred help` | Show the usage text. |
 
-`KEY` is a credential reference name, the same environment-variable-style name the Harness uses inside `refs` (`[A-Za-z_][A-Za-z0-9_]*`). `VALUE` is one argument, so quote a value that contains spaces. A new `KEY` is added to the `refs` mapping; an existing key keeps its position.
+`KEY` is a credential reference name, the same environment-variable-style name the Harness uses inside `refs` (`[A-Za-z_][A-Za-z0-9_]*`). `VALUE` is one argument, so quote a value that contains spaces and put `--` before a value that starts with two dashes. A new `KEY` is added to the `refs` mapping; an existing key keeps its position.
 
 ## Confirmation
 
@@ -51,11 +52,11 @@ The first `/cred set` stores the pending update in the plugin process and shows 
 - the operator runs the identical `/cred set` command again;
 - the original command carried `--skip-confirm`.
 
-A different `/cred set` replaces the pending update. The pending value lives only in the plugin process memory and is discarded when the plugin unloads.
+A different `/cred set` replaces the pending update. When the document does not exist yet, the confirmation shows `(not set)` as the current value and the staged write creates the document in the version 1 layout. The pending value lives only in the plugin process memory and is discarded when the plugin unloads.
 
 ## Masking and output
 
-Every message except `/cred read` shows a masked value: nothing for eight characters or fewer, otherwise a short prefix and suffix. `/cred read` prints the decoded value because that is its purpose. Error messages never include a decoded value, and a parse error reports only the document path and a line number, never the offending text.
+Every message except `/cred read` shows a masked value: nothing for twelve characters or fewer; a longer value shows a three- or four-character prefix and suffix, never more than half of it. `/cred read` prints the decoded value because that is its purpose. Error messages never include a decoded value, and a parse error reports only the document path and a line number, never the offending text.
 
 ## Where the document lives
 
@@ -69,13 +70,17 @@ The first and last cases cover the default installation. The second case is what
 
 ## Write safety
 
-The store parses the refs mapping, rewrites only the target line, then checks that the refs mapping and every byte before and after the block are unchanged except for that one value. It supports the scalar styles the credentials writer emits and refuses a construct outside that subset. The update is refused when the file changed after it was read. The new text is written to an owner-only temporary file beside the document, flushed to disk, and renamed over the document, so a failure never leaves a half-written credentials file. Comments, the document version, the `records` section and the formatting of every other entry are kept.
+The store takes the same cross-process writer lock the Harness uses (`<document>.lock`: created with `wx` semantics, records the holder's process id, removed when the cycle ends) and performs its whole read-modify-write under it, so the plugin and the Harness never replace each other's snapshot. A lock whose recorded process exited is taken over through a claim file, and a lock that stays held fails the command after a bounded wait instead of writing over a state the plugin could not read.
+
+The scalar reader covers the forms the Harness writer emits: plain, single- and double-quoted scalars, including values wrapped over several lines and double-quoted escapes, and literal or folded block scalars with every chomping indicator. A construct outside that subset is refused instead of guessed at. The `refs` section may be a block mapping, the empty inline form the writer leaves after the last reference is deleted (`refs: {}`), or absent; a write to an absent section creates the version 1 layout, and only for a document that already declares that version or is empty apart from comments. Comments and blank lines never truncate the section, and the indentation of an existing entry is reused. YAML forbids tabs as indentation, so a tab-indented entry is refused with a message instead of being rewritten.
+
+Only the target entry is replaced. The store then verifies that the refs mapping and every byte before and after the section are unchanged except for that value; when a writer that ignores the lock changed the file in the meantime, the fingerprint check refuses the update. The new text is written to an owner-only temporary file beside the document, flushed to disk, and renamed over the document, so a failure never leaves a half-written credentials file, and the directory is flushed where the platform allows it. On Windows, transient replacement failures are retried and the owner-only chmod step is skipped, because Windows has no descriptor-level mode. Comments, the document version, the `records` section and the formatting of every other entry are kept.
 
 ## Security notes
 
 - The plugin registers a command, not a tool. Command execution does not pass through the model and the handler runs with the plugin's own file access, so this plugin adds a human surface over the access a Python plugin already has.
 - dsh records command lifecycle entries in the session event log. A `/cred set` line contains the new value as a command argument, and a `/cred read` result contains the value it printed. Commands are not sent to the model, but the log is persisted. Treat session storage with the same care as the credentials file, or rotate a value if that storage is exposed.
-- The confirmation step prevents an accidental write. It is not authentication: any local process that runs as the same user could read or write the document directly.
+- The confirmation step prevents an accidental write. It is not authentication, and the writer lock is coordination rather than a security boundary: any local process that runs as the same user could read or write the document directly.
 - The store writes with mode 600. The Harness credentials provider refuses to serve a document that is readable beyond its owner.
 
 ## Development
@@ -89,6 +94,6 @@ uv run python -m unittest discover -s tests -v
 ./format_code.sh --apply
 ```
 
-`check_code.sh` runs ty, ruff check, the ruff format check and the docstring/code format check. `format_code.sh` checks formatting without writing, and `--apply` rewrites the files. Both scripts use the tools from the uv environment and fall back to `PATH`.
+`check_code.sh` runs ty, ruff check, the ruff format check and the docstring/code format check. `format_code.sh` checks formatting without writing, and `--apply` rewrites the files. Both scripts use the tools from the uv environment and fall back to `PATH`. The tests include a document captured from the Harness writer, so the scalar forms and the refs section shapes the writer produces stay covered.
 
 The plugin has no third-party runtime dependency. It parses the refs subset itself, so the shared profile environment only needs the interpreter.

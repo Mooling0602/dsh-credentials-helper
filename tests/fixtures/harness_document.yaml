@@ -1,0 +1,42 @@
+version: 1
+refs:
+  ALPHA: simple-plain-value
+  BETA_PLAIN_WRAPPED: correct horse battery staple
+    xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  GAMMA_SINGLE_WRAPPED: it's a stored oauth blob word word word word word word word word word word
+    word word word word word word word word word word word word word word word
+    word word word word word
+  DELTA_DOUBLE_ESCAPED: "line \"quoted\" with tab\t and control\x01 word word word word word word
+    word word word word word word word word word word word word word word"
+  EPSILON_LITERAL: |
+    -----BEGIN PRIVATE KEY-----
+    MIIB
+    -----END PRIVATE KEY-----
+  ZETA_STRIPPED: |-
+    first line
+    second line
+  ETA_KEEP: |+
+    kept
+
+
+  THETA_INDENTED: |
+    first
+      indented
+  IOTA_LOOKALIKE: "true"
+  KAPPA_NUMBERISH: "123"
+  LAMBDA_HASH: "#not-a-comment"
+  MU_SPACED: " padded "
+records:
+  codex-subscription/accounts:
+    kind: grant
+    payload:
+      version: 1
+      accounts:
+        - id: account-1
+          label: work
+          enabled: true
+  deepseek-account-platform/default:
+    kind: api-key
+    key: provider-key-name
+    env:
+      PROVIDER_API_KEY: stored-by-the-provider

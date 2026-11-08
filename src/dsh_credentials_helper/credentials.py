@@ -3,97 +3,85 @@
 The document at <DSH_HOME>/.credentials.yaml is owned by DeepSeek
 Harness. Its refs mapping holds environment-variable-style names mapped
 to secret strings, and its records mapping holds provider state. This
-module only ever rewrites the one reference line it is asked to change;
-every other byte of the document, including comments and the formatting
-of neighbouring entries, is kept.
+module only ever rewrites the one reference it is asked to change; every
+other byte of the document, including comments and the formatting of
+neighbouring entries, is kept.
 
-The module parses the refs block itself so the plugin needs no third-
-party runtime dependency. Scalar styles the writer emits are supported:
-plain, single-quoted, double-quoted and block literals. A construct
-outside that subset is refused instead of guessed at.
+DeepSeek Harness writes the document with a full YAML implementation, so
+the scalar forms a value may take, and the shapes the refs section may
+take, both follow that writer. The scalar subset itself lives in
+:mod:`dsh_credentials_helper._yaml`; the writer lock and the atomic
+replacement live in :mod:`dsh_credentials_helper._atomic`. This module
+locates the refs section, rewrites one entry and verifies that nothing
+else changed.
 """
 
 from __future__ import annotations
 
 import os
 import re
-import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
+from ._atomic import document_lock, write_atomic
+from ._errors import (
+    CredentialsError,
+    DocumentChanged,
+    DocumentNotFound,
+    ReferenceNotFound,
+)
+from ._yaml import (
+    CR,
+    KEY_PATTERN,
+    LF,
+    RefEntry,
+    encode_scalar,
+    leading_whitespace,
+    line_error,
+    parse_refs,
+    strip_comment,
+)
+from .paths import resolve_credentials_path
+
 REFERENCE_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_QUOTED_KEY_PATTERN = re.compile(r"^[\"']([^\"']+)[\"'][ \t]*:")
+_EMPTY_FLOW_PATTERN = re.compile(r"\{\s*\}")
 """Grammar DeepSeek Harness uses for a credential reference name."""
 
 REFS_SECTION = "refs"
 """Top-level section that holds the reference mapping."""
 
-LF = chr(10)
-CR = chr(13)
-TAB = chr(9)
-BACKSLASH = chr(92)
-DOUBLE_QUOTE = chr(34)
-SINGLE_QUOTE = chr(39)
-HASH = "#"
+_DOCUMENT_VERSION = "1"
+"""Document layout this plugin writes when it has to create the section."""
 
-_KEY_LINE_PATTERN = re.compile("^([A-Za-z_][A-Za-z0-9_]*)[ " + TAB + "]*:(.*)$")
-_OWNER_ONLY_MODE = 0o600
-"""Permission bits of every document this module writes."""
+_VERSION_ACCEPTED = ("1", "'1'", '"1"')
+"""Version spellings that name the layout this plugin understands."""
 
-_SIMPLE_ESCAPES = {
-    "0": chr(0),
-    "a": chr(7),
-    "b": chr(8),
-    "t": TAB,
-    "n": LF,
-    "v": chr(11),
-    "f": chr(12),
-    "r": CR,
-    "e": chr(27),
-    " ": " ",
-    DOUBLE_QUOTE: DOUBLE_QUOTE,
-    "/": "/",
-    BACKSLASH: BACKSLASH,
-    "N": chr(0x85),
-    "_": chr(0xA0),
-    "L": chr(0x2028),
-    "P": chr(0x2029),
-}
-"""Single-character YAML escape sequences supported in double-quoted values."""
+_ENTRY_INDENT = "  "
+"""Indentation used for an entry the store has to create from nothing."""
 
-
-class CredentialsError(RuntimeError):
-    """Raised when the document cannot be read or updated safely."""
-
-
-class ReferenceNotFound(CredentialsError):
-    """Raised when the requested reference is absent from the document."""
-
-
-class DocumentChanged(CredentialsError):
-    """Raised when the document changed between the read and the write."""
-
-
-def validate_reference_name(name: str) -> None:
-    """Validate one credential reference name.
-
-    :param name: Candidate reference name.
-    :type name: str
-    :raises CredentialsError: When the name is outside the harness
-        grammar.
-    """
-    if not REFERENCE_PATTERN.fullmatch(name):
-        raise CredentialsError(
-            f'invalid reference name "{name}"; use letters, digits and '
-            "underscores, starting with a letter or underscore"
-        )
+__all__ = [
+    "REFERENCE_PATTERN",
+    "REFS_SECTION",
+    "CredentialsError",
+    "CredentialsStore",
+    "DocumentChanged",
+    "DocumentNotFound",
+    "ReferenceNotFound",
+    "validate_reference_name",
+]
 
 
 class CredentialsStore:
     """Reads and updates one credential document.
 
     The store resolves the document path lazily, so a path problem
-    becomes a command error instead of a failed plugin start. Writes are
-    atomic, stay owner-only, and are refused when the document changed
-    after it was read.
+    becomes a command error instead of a failed plugin start. Writes
+    take the same sibling lock file the harness uses, read the document
+    under it, replace only the target entry, verify the rest of the
+    document is unchanged, and commit with an atomic rename. A missing
+    document is created in the version 1 layout, because the harness
+    treats an absent document as an empty store.
     """
 
     def __init__(self, path: Path | None = None) -> None:
@@ -110,8 +98,6 @@ class CredentialsStore:
         """
         if self._path is not None:
             return self._path
-        from .paths import resolve_credentials_path
-
         return resolve_credentials_path()
 
     def read_reference(self, name: str) -> str:
@@ -158,49 +144,84 @@ class CredentialsStore:
         :rtype: bool
         :raises CredentialsError: When the name, the value or the
             document is invalid, when the edit would change unrelated
-            content, or when the document changed after it was read.
+            content, or when the writer lock cannot be taken.
         """
         validate_reference_name(name)
         if not isinstance(value, str) or value == "":
             raise CredentialsError("the new value must be a non-empty string")
         path = self.path
-        fingerprint = _document_fingerprint(path)
-        text, refs = _load_document(path)
-        if refs.get(name) == value:
-            return False
-
-        rewritten = _rewrite_reference(text, name, value, refs, path)
-        if _document_fingerprint(path) != fingerprint:
-            raise DocumentChanged(
-                "the credentials file changed while the update was being prepared; "
-                "run the command again"
+        with document_lock(path):
+            existed = path.exists()
+            fingerprint = _document_fingerprint(path) if existed else None
+            if existed:
+                text, refs = _load_document(path)
+            else:
+                text, refs = "", {}
+            if refs.get(name) == value:
+                return False
+            expected = dict(refs)
+            expected[name] = value
+            rewritten, preserved_prefix, preserved_suffix = _rewrite_reference(
+                text, path, name, value
             )
-        _write_atomic(path, rewritten)
-        return True
+            _verify_rewrite(
+                rewritten, path, expected, preserved_prefix, preserved_suffix
+            )
+            if existed:
+                if _document_fingerprint(path) != fingerprint:
+                    raise DocumentChanged(
+                        "the credentials file changed while the update was "
+                        "being prepared; run the command again"
+                    )
+            elif path.exists():
+                raise DocumentChanged(
+                    "the credentials file appeared while the update was "
+                    "being prepared; run the command again"
+                )
+            write_atomic(path, rewritten)
+            return True
 
 
-def _load_document(path: Path) -> tuple[str, dict[str, str]]:
-    """Read and parse the refs mapping of one credential document.
+def validate_reference_name(name: str) -> None:
+    """Validate one credential reference name.
 
-    :param path: Absolute document path.
-    :type path: pathlib.Path
-    :returns: The raw UTF-8 text and the parsed reference mapping.
-    :rtype: tuple[str, dict[str, str]]
-    :raises CredentialsError: When the file is absent, unreadable or
-        invalid.
+    :param name: Candidate reference name.
+    :type name: str
+    :raises CredentialsError: When the name is outside the harness
+        grammar.
     """
-    try:
-        with path.open("r", encoding="utf-8", newline="") as handle:
-            text = handle.read()
-    except FileNotFoundError:
-        raise CredentialsError(f"credentials file not found: {path}") from None
-    except OSError as error:
+    if not REFERENCE_PATTERN.fullmatch(name):
         raise CredentialsError(
-            f"cannot read {path}: {error.strerror or 'I/O error'}"
-        ) from None
-    lines, _, _ = _document_lines(text)
-    _, start, end = _refs_block(lines, path)
-    return text, _parse_refs(lines, start, end, path)
+            f'invalid reference name "{name}"; use letters, digits and '
+            "underscores, starting with a letter or underscore"
+        )
+
+
+@dataclass(frozen=True)
+class _RefsLayout:
+    """Where the refs section sits in one document, and in what shape.
+
+    :param kind: One of ``block``, ``inline_empty`` or ``absent``.
+    :type kind: str
+    :param header: Index of the refs header line, or -1 when absent.
+    :type header: int
+    :param start: First line of the refs block.
+    :type start: int
+    :param end: One past the last line of the refs block.
+    :type end: int
+    :param version_index: Index of the top-level version line, or -1.
+    :type version_index: int
+    :param version_value: Text after the version colon, without a
+        comment.
+    :type version_value: str
+    """
+
+    kind: str
+    header: int
+    start: int
+    end: int
+    version_index: int
+    version_value: str
 
 
 def _document_lines(text: str) -> tuple[list[str], str, bool]:
@@ -220,495 +241,140 @@ def _document_lines(text: str) -> tuple[list[str], str, bool]:
     return lines, newline, trailing
 
 
-def _leading_whitespace(line: str) -> str:
-    """Return the leading space and tab characters of one line.
+def _read_document(path: Path) -> tuple[str, list[str], str, bool]:
+    """Read the document and split it into lines.
 
-    :param line: One line without its line ending.
-    :type line: str
-    :returns: The leading indentation.
-    :rtype: str
-    """
-    end = 0
-    while end < len(line) and line[end] in (" ", TAB):
-        end += 1
-    return line[:end]
-
-
-def _strip_comment(text: str) -> str:
-    """Remove a trailing YAML comment from one scalar or header.
-
-    :param text: Text after an entry colon or a block scalar indicator.
-    :type text: str
-    :returns: The text before the comment marker.
-    :rtype: str
-    """
-    index = 0
-    while index + 1 < len(text):
-        if text[index] in (" ", TAB) and text[index + 1] == HASH:
-            return text[:index]
-        index += 1
-    return text
-
-
-def _line_error(path: Path, index: int, detail: str) -> CredentialsError:
-    """Build a parse error that names the path and line but never its content.
-
-    :param path: Document path.
+    :param path: Absolute document path.
     :type path: pathlib.Path
-    :param index: Zero-based line index.
-    :type index: int
-    :param detail: Description of the failed construct.
-    :type detail: str
-    :returns: The error to raise.
-    :rtype: CredentialsError
+    :returns: The raw text, its lines, the line ending and whether the
+        last line ends with a line ending.
+    :rtype: tuple[str, list[str], str, bool]
+    :raises DocumentNotFound: When the document does not exist.
+    :raises CredentialsError: When the document cannot be read.
     """
-    return CredentialsError(f"cannot parse {path}: {detail} at line {index + 1}")
+    try:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            text = handle.read()
+    except FileNotFoundError:
+        raise DocumentNotFound(f"credentials file not found: {path}") from None
+    except OSError as error:
+        raise CredentialsError(
+            f"cannot read {path}: {error.strerror or 'I/O error'}"
+        ) from None
+    lines, newline, trailing = _document_lines(text)
+    return text, lines, newline, trailing
 
 
-def _refs_block(lines: list[str], path: Path) -> tuple[int, int, int]:
-    """Locate the top-level refs mapping in the document lines.
+def _load_document(path: Path) -> tuple[str, dict[str, str]]:
+    """Read and parse the refs mapping of one credential document.
+
+    A document whose refs section is missing or empty resolves as a store
+    with no references: the harness treats both as an empty store, and a
+    write creates the section when it is needed.
+
+    :param path: Absolute document path.
+    :type path: pathlib.Path
+    :returns: The raw UTF-8 text and the parsed reference mapping.
+    :rtype: tuple[str, dict[str, str]]
+    :raises CredentialsError: When the file is absent, unreadable or
+        invalid.
+    """
+    text, lines, _, _ = _read_document(path)
+    layout = _locate_refs(lines, path)
+    if layout.kind != "block":
+        return text, {}
+    entries = parse_refs(lines, layout.start, layout.end, path)
+    return text, {name: entry.value for name, entry in entries.items()}
+
+
+def _locate_refs(lines: list[str], path: Path) -> _RefsLayout:
+    """Locate the top-level refs section in the document lines.
+
+    The section may be a block mapping, an empty inline form the harness
+    writes after the last reference is deleted, or absent entirely.
 
     :param lines: Document lines without their line endings.
     :type lines: list[str]
     :param path: Document path used in error messages.
     :type path: pathlib.Path
-    :returns: Index of the header line, first block line and one past
-        the block.
-    :rtype: tuple[int, int, int]
-    :raises CredentialsError: When the header is absent or uses a flow
-        mapping.
+    :returns: The section layout.
+    :rtype: _RefsLayout
+    :raises CredentialsError: When the header uses an unsupported form.
     """
-    header = -1
+    version_index = -1
+    version_value = ""
     for index, line in enumerate(lines):
-        match = re.match("^([A-Za-z_][A-Za-z0-9_]*)[ " + TAB + "]*:", line)
-        if match is None or match.group(1) != REFS_SECTION:
+        if leading_whitespace(line) != "":
             continue
-        rest = _strip_comment(line[match.end() :]).strip()
+        quoted = _QUOTED_KEY_PATTERN.match(line)
+        if quoted is not None:
+            if quoted.group(1) == REFS_SECTION:
+                raise line_error(
+                    path,
+                    index,
+                    "the refs key must be written without quotes",
+                )
+            continue
+        match = KEY_PATTERN.match(line)
+        if match is None:
+            continue
+        name = match.group(1)
+        rest = strip_comment(match.group(2)).strip()
+        if name == "version" and version_index < 0:
+            version_index = index
+            version_value = rest
+            continue
+        if name != REFS_SECTION:
+            continue
         if rest == "":
-            header = index
-            break
-        raise _line_error(
+            start = index + 1
+            return _RefsLayout(
+                "block",
+                index,
+                start,
+                _refs_block_end(lines, start),
+                version_index,
+                version_value,
+            )
+        if rest in ("null", "~") or _EMPTY_FLOW_PATTERN.fullmatch(rest):
+            return _RefsLayout(
+                "inline_empty",
+                index,
+                index + 1,
+                index + 1,
+                version_index,
+                version_value,
+            )
+        raise line_error(
             path, index, "expected a block mapping below a bare refs header"
         )
-    if header < 0:
-        raise CredentialsError(f"cannot parse {path}: the document has no refs section")
-
-    start = header + 1
-    end = start
-    while end < len(lines):
-        line = lines[end]
-        if line.strip() == "" or _leading_whitespace(line) != "":
-            end += 1
-            continue
-        break
-    return header, start, end
+    insertion = version_index + 1 if version_index >= 0 else len(lines)
+    return _RefsLayout("absent", -1, insertion, insertion, version_index, version_value)
 
 
-def _parse_refs(lines: list[str], start: int, end: int, path: Path) -> dict[str, str]:
-    """Parse the refs mapping with a strict YAML scalar subset.
+def _refs_block_end(lines: list[str], start: int) -> int:
+    """Return one past the last line that belongs to the refs block.
+
+    Blank lines, comments and indented lines continue the block, which
+    is what keeps a comment between two entries from truncating the
+    mapping.
 
     :param lines: Document lines without their line endings.
     :type lines: list[str]
     :param start: First line of the refs block.
     :type start: int
-    :param end: One past the last line of the refs block.
-    :type end: int
-    :param path: Document path used in error messages.
-    :type path: pathlib.Path
-    :returns: Reference names mapped to decoded string values.
-    :rtype: dict[str, str]
-    :raises CredentialsError: When the block is not a mapping of
-        strings.
+    :returns: One past the block's last line.
+    :rtype: int
     """
-    entries: dict[str, str] = {}
-    indent: str | None = None
-    index = start
-    while index < end:
-        line = lines[index]
+    end = start
+    while end < len(lines):
+        line = lines[end]
         stripped = line.strip()
-        if stripped == "" or stripped.startswith(HASH):
-            index += 1
+        if stripped == "" or stripped.startswith("#") or leading_whitespace(line) != "":
+            end += 1
             continue
-        leading = _leading_whitespace(line)
-        if indent is None:
-            if leading == "":
-                raise _line_error(path, index, "the refs entry is not indented")
-            indent = leading
-        elif leading != indent:
-            raise _line_error(path, index, "unexpected indentation in the refs block")
-        match = _KEY_LINE_PATTERN.match(line[len(indent) :])
-        if match is None:
-            raise _line_error(path, index, "the refs entry is not a plain string key")
-        key, raw = match.group(1), match.group(2).lstrip(" " + TAB)
-        if key in entries:
-            raise _line_error(
-                path, index, f'reference "{key}" is declared more than once'
-            )
-        value, index = _parse_value(lines, index, end, indent, raw, path)
-        entries[key] = value
-    return entries
-
-
-def _parse_value(
-    lines: list[str],
-    index: int,
-    end: int,
-    indent: str,
-    raw: str,
-    path: Path,
-) -> tuple[str, int]:
-    """Decode one refs value and return the next line index.
-
-    :param lines: Document lines without their line endings.
-    :type lines: list[str]
-    :param index: Index of the entry line.
-    :type index: int
-    :param end: One past the last line of the refs block.
-    :type end: int
-    :param indent: Indentation of the entry line.
-    :type indent: str
-    :param raw: Text after the entry colon.
-    :type raw: str
-    :param path: Document path used in error messages.
-    :type path: pathlib.Path
-    :returns: The decoded value and the next line index.
-    :rtype: tuple[str, int]
-    :raises CredentialsError: When the scalar style is outside the
-        subset.
-    """
-    if raw == "":
-        if index + 1 < end and _leading_whitespace(lines[index + 1]) != "":
-            raise _line_error(
-                path, index, "nested values are not supported in the refs block"
-            )
-        raise _line_error(path, index, "the refs entry has no scalar value")
-    first = raw[0]
-    if first in ("|", ">"):
-        return _parse_block_scalar(lines, index, end, indent, raw, path)
-    if first == SINGLE_QUOTE:
-        return _parse_single_quoted(raw, index, path)
-    if first == DOUBLE_QUOTE:
-        return _parse_double_quoted(raw, index, path)
-    return _parse_plain(lines, index, end, indent, raw, path)
-
-
-def _parse_single_quoted(raw: str, index: int, path: Path) -> tuple[str, int]:
-    """Decode one single-quoted scalar on a single line.
-
-    :param raw: Scalar text including the opening quote.
-    :type raw: str
-    :param index: Entry line index used in error messages.
-    :type index: int
-    :param path: Document path used in error messages.
-    :type path: pathlib.Path
-    :returns: The decoded value and the next line index.
-    :rtype: tuple[str, int]
-    :raises CredentialsError: When the scalar is malformed or multi-
-        line.
-    """
-    characters: list[str] = []
-    position = 1
-    while position < len(raw):
-        character = raw[position]
-        if character == SINGLE_QUOTE:
-            if position + 1 < len(raw) and raw[position + 1] == SINGLE_QUOTE:
-                characters.append(SINGLE_QUOTE)
-                position += 2
-                continue
-            tail = _strip_comment(raw[position + 1 :]).strip()
-            if tail != "":
-                raise _line_error(
-                    path, index, "unexpected text after a single-quoted value"
-                )
-            return "".join(characters), index + 1
-        characters.append(character)
-        position += 1
-    raise _line_error(
-        path,
-        index,
-        "unterminated single-quoted value; multi-line values are not supported",
-    )
-
-
-def _parse_double_quoted(raw: str, index: int, path: Path) -> tuple[str, int]:
-    """Decode one double-quoted scalar on a single line.
-
-    :param raw: Scalar text including the opening quote.
-    :type raw: str
-    :param index: Entry line index used in error messages.
-    :type index: int
-    :param path: Document path used in error messages.
-    :type path: pathlib.Path
-    :returns: The decoded value and the next line index.
-    :rtype: tuple[str, int]
-    :raises CredentialsError: When the scalar uses an unsupported escape
-        or is malformed.
-    """
-    characters: list[str] = []
-    position = 1
-    while position < len(raw):
-        character = raw[position]
-        if character == DOUBLE_QUOTE:
-            tail = _strip_comment(raw[position + 1 :]).strip()
-            if tail != "":
-                raise _line_error(
-                    path, index, "unexpected text after a double-quoted value"
-                )
-            return "".join(characters), index + 1
-        if character != BACKSLASH:
-            characters.append(character)
-            position += 1
-            continue
-        position += 1
-        if position >= len(raw):
-            raise _line_error(
-                path, index, "the double-quoted value ends with a dangling escape"
-            )
-        escape = raw[position]
-        if escape in _SIMPLE_ESCAPES:
-            characters.append(_SIMPLE_ESCAPES[escape])
-            position += 1
-            continue
-        widths = {"x": 2, "u": 4, "U": 8}
-        if escape in widths:
-            width = widths[escape]
-            digits = raw[position + 1 : position + 1 + width]
-            if len(digits) != width or any(
-                item not in "0123456789abcdefABCDEF" for item in digits
-            ):
-                raise _line_error(
-                    path, index, "invalid hexadecimal escape in a double-quoted value"
-                )
-            try:
-                characters.append(chr(int(digits, 16)))
-            except ValueError:
-                raise _line_error(
-                    path, index, "invalid code point in a double-quoted value"
-                ) from None
-            position += 1 + width
-            continue
-        raise _line_error(path, index, "unsupported escape in a double-quoted value")
-    raise _line_error(
-        path,
-        index,
-        "unterminated double-quoted value; multi-line values are not supported",
-    )
-
-
-def _parse_plain(
-    lines: list[str], index: int, end: int, indent: str, raw: str, path: Path
-) -> tuple[str, int]:
-    """Decode one plain scalar on a single line.
-
-    :param lines: Document lines without their line endings.
-    :type lines: list[str]
-    :param index: Entry line index.
-    :type index: int
-    :param end: One past the last line of the refs block.
-    :type end: int
-    :param indent: Indentation of the entry line.
-    :type indent: str
-    :param raw: Text after the entry colon.
-    :type raw: str
-    :param path: Document path used in error messages.
-    :type path: pathlib.Path
-    :returns: The decoded value and the next line index.
-    :rtype: tuple[str, int]
-    :raises CredentialsError: When the value is empty, multi-line or not
-        a string.
-    """
-    value = _strip_comment(raw).rstrip()
-    if value == "":
-        raise _line_error(path, index, "the refs entry has an empty value")
-    if (
-        index + 1 < end
-        and lines[index + 1].strip() != ""
-        and len(_leading_whitespace(lines[index + 1])) > len(indent)
-    ):
-        raise _line_error(path, index, "multi-line plain values are not supported")
-    if _plain_is_not_a_string(value):
-        raise _line_error(path, index, "the refs entry is not a string")
-    return value, index + 1
-
-
-def _plain_is_not_a_string(value: str) -> bool:
-    """Report whether a plain scalar would parse as null or a number.
-
-    :param value: Plain scalar text.
-    :type value: str
-    :returns: True when the value is not a YAML string.
-    :rtype: bool
-    """
-    if value.lower() in ("null", "~", "true", "false"):
-        return True
-    try:
-        float(value)
-    except ValueError:
-        return False
-    return True
-
-
-def _parse_block_scalar(
-    lines: list[str], index: int, end: int, indent: str, raw: str, path: Path
-) -> tuple[str, int]:
-    """Decode one literal or folded block scalar.
-
-    :param lines: Document lines without their line endings.
-    :type lines: list[str]
-    :param index: Entry line index.
-    :type index: int
-    :param end: One past the last line of the refs block.
-    :type end: int
-    :param indent: Indentation of the entry line.
-    :type indent: str
-    :param raw: Block scalar header, starting with a pipe or a greater-
-        than sign.
-    :type raw: str
-    :param path: Document path used in error messages.
-    :type path: pathlib.Path
-    :returns: The decoded value and the next line index.
-    :rtype: tuple[str, int]
-    :raises CredentialsError: When the header or the content is
-        malformed.
-    """
-    indicator = raw[0]
-    header = _strip_comment(raw[1:]).strip()
-    chomp = ""
-    content_offset = 0
-    for character in header:
-        if character in ("+", "-") and chomp == "":
-            chomp = character
-        elif character.isdigit() and content_offset == 0:
-            content_offset = int(character)
-        else:
-            raise _line_error(path, index, "unsupported block scalar header")
-    content: list[str] = []
-    cursor = index + 1
-    while cursor < end:
-        line = lines[cursor]
-        if line.strip() == "":
-            content.append("")
-            cursor += 1
-            continue
-        if len(_leading_whitespace(line)) <= len(indent):
-            break
-        content.append(line)
-        cursor += 1
-
-    content_indent = len(indent) + content_offset if content_offset else 0
-    if not content_indent:
-        for line in content:
-            if line.strip() != "":
-                content_indent = len(_leading_whitespace(line))
-                break
-    stripped_lines: list[str] = []
-    for line in content:
-        if line.strip() == "":
-            stripped_lines.append("")
-            continue
-        leading = _leading_whitespace(line)
-        if len(leading) < content_indent:
-            raise _line_error(path, index, "inconsistent indentation in a block scalar")
-        stripped_lines.append(line[content_indent:])
-
-    if indicator == "|":
-        value = LF.join(stripped_lines)
-    else:
-        value = _fold_lines(stripped_lines)
-    if chomp == "-":
-        value = value.rstrip(LF)
-    else:
-        value = value.rstrip(LF)
-        if content:
-            value += LF
-    return value, cursor
-
-
-def _fold_lines(lines: list[str]) -> str:
-    """Apply YAML folded-scalar line folding.
-
-    :param lines: Block content lines without their common indentation.
-    :type lines: list[str]
-    :returns: The folded text.
-    :rtype: str
-    """
-    parts: list[str] = []
-    previous_blank = True
-    for line in lines:
-        if line == "":
-            parts.append(LF)
-            previous_blank = True
-            continue
-        if parts and not previous_blank:
-            parts.append(" ")
-        parts.append(line)
-        previous_blank = False
-    return "".join(parts)
-
-
-def _rewrite_reference(
-    text: str, name: str, value: str, refs: dict[str, str], path: Path
-) -> str:
-    """Rewrite or insert one refs entry and verify the surrounding bytes.
-
-    :param text: Raw document text.
-    :type text: str
-    :param name: Validated reference name.
-    :type name: str
-    :param value: New non-empty value.
-    :type value: str
-    :param refs: Reference mapping parsed from the same text.
-    :type refs: dict[str, str]
-    :param path: Document path used in error messages.
-    :type path: pathlib.Path
-    :returns: The rewritten document text.
-    :rtype: str
-    :raises CredentialsError: When the edit would change unrelated
-        content.
-    """
-    lines, newline, trailing = _document_lines(text)
-    _, start, end = _refs_block(lines, path)
-    header_lines = list(lines[:start])
-    suffix_lines = list(lines[end:])
-    indent = _entry_indent(lines, start, end)
-    pattern = re.compile("^([ " + TAB + "]+)" + re.escape(name) + "[ " + TAB + "]*:")
-    matches = [index for index in range(start, end) if pattern.match(lines[index])]
-    if len(matches) > 1:
-        raise CredentialsError(
-            f'refusing to write: the refs section declares "{name}" more than once'
-        )
-
-    scalar = _encode_scalar(value)
-    if matches:
-        lines[matches[0]] = f"{indent}{name}: {scalar}"
-    else:
-        insertion = start
-        for index in range(start, end):
-            if lines[index].strip() != "":
-                insertion = index + 1
-        lines.insert(insertion, f"{indent}{name}: {scalar}")
-
-    rewritten = newline.join(lines)
-    if trailing:
-        rewritten += newline
-
-    new_lines, _, _ = _document_lines(rewritten)
-    _, new_start, new_end = _refs_block(new_lines, path)
-    if new_lines[:new_start] != header_lines:
-        raise CredentialsError(
-            "refusing to write: the edit would change the document header"
-        )
-    if new_lines[new_end:] != suffix_lines:
-        raise CredentialsError(
-            "refusing to write: the edit would change content after the refs block"
-        )
-    expected = dict(refs)
-    expected[name] = value
-    if _parse_refs(new_lines, new_start, new_end, path) != expected:
-        raise CredentialsError(
-            "refusing to write: the edit would change unrelated refs entries"
-        )
-    return rewritten
+        break
+    return end
 
 
 def _entry_indent(lines: list[str], start: int, end: int) -> str:
@@ -720,44 +386,235 @@ def _entry_indent(lines: list[str], start: int, end: int) -> str:
     :type start: int
     :param end: One past the last line of the refs block.
     :type end: int
-    :returns: The indentation of the first entry, or two spaces when the
-        block is empty.
+    :returns: The indentation of the first entry, of the first indented
+        comment, or two spaces when the block has neither.
     :rtype: str
     """
+    comment_indent = ""
     for index in range(start, end):
-        match = _KEY_LINE_PATTERN.match(lines[index])
-        if match is not None:
-            return _leading_whitespace(lines[index])
-    return "  "
+        line = lines[index]
+        stripped = line.lstrip(" \t")
+        if stripped == "":
+            continue
+        if stripped.startswith("#"):
+            if not comment_indent:
+                comment_indent = line[: len(line) - len(stripped)]
+            continue
+        if KEY_PATTERN.match(stripped) is not None:
+            indent = line[: len(line) - len(stripped)]
+            if "\t" in indent:
+                return _ENTRY_INDENT
+            return indent
+    if "\t" in comment_indent:
+        return _ENTRY_INDENT
+    return comment_indent or _ENTRY_INDENT
 
 
-def _encode_scalar(value: str) -> str:
-    """Render one string as a single-line YAML double-quoted scalar.
+def _entry_insertion(
+    lines: list[str], layout: _RefsLayout, entries: dict[str, RefEntry]
+) -> int:
+    """Return where a new entry belongs inside the refs block.
 
-    :param value: The string to render.
-    :type value: str
-    :returns: A double-quoted YAML scalar.
-    :rtype: str
+    A block with entries grows after its last entry, so a section
+    comment written above the first entry stays attached to it. A block
+    without entries grows after its last non-blank line.
+
+    :param lines: Document lines without their line endings.
+    :type lines: list[str]
+    :param layout: The refs section layout.
+    :type layout: _RefsLayout
+    :param entries: Parsed entries of the block.
+    :type entries: dict[str, RefEntry]
+    :returns: The line index to insert at.
+    :rtype: int
     """
-    characters = [DOUBLE_QUOTE]
-    for character in value:
-        code = ord(character)
-        if character == BACKSLASH:
-            characters.append(BACKSLASH + BACKSLASH)
-        elif character == DOUBLE_QUOTE:
-            characters.append(BACKSLASH + DOUBLE_QUOTE)
-        elif character == LF:
-            characters.append(BACKSLASH + "n")
-        elif character == CR:
-            characters.append(BACKSLASH + "r")
-        elif character == TAB:
-            characters.append(BACKSLASH + "t")
-        elif code < 0x20 or code == 0x7F:
-            characters.append(BACKSLASH + "x" + format(code, "02x"))
+    if entries:
+        return max(entry.next_line for entry in entries.values())
+    for index in range(layout.end - 1, layout.start - 1, -1):
+        if lines[index].strip() != "":
+            return index + 1
+    return layout.start
+
+
+def _create_refs_section(
+    lines: list[str], path: Path, layout: _RefsLayout, entry_line: str
+) -> tuple[list[str], list[str]]:
+    """Add a refs section to a document that has none.
+
+    The version 1 layout is only created when the document already
+    declares that version, or when it is empty apart from comments: the
+    harness rejects a version-less document that carries content, and
+    this plugin never guesses at a layout it does not know.
+
+    :param lines: Document lines without their line endings.
+    :type lines: list[str]
+    :param path: Document path used in error messages.
+    :type path: pathlib.Path
+    :param layout: The refs section layout of the original document.
+    :type layout: _RefsLayout
+    :param entry_line: Fully indented entry line to insert.
+    :type entry_line: str
+    :returns: The new lines and the preserved prefix and suffix around
+        the created section.
+    :rtype: tuple[list[str], list[str]]
+    :raises CredentialsError: When the document layout does not allow
+        creating the section.
+    """
+    if layout.version_index >= 0:
+        if layout.version_value not in _VERSION_ACCEPTED:
+            declared = layout.version_value or "(none)"
+            raise CredentialsError(
+                f"refusing to write: {path} declares version {declared}; "
+                "this plugin writes the version 1 layout"
+            )
+        insertion = layout.version_index + 1
+        prefix = list(lines[:insertion])
+        suffix = list(lines[insertion:])
+        lines[insertion:insertion] = [f"{REFS_SECTION}:", entry_line]
+        return prefix, suffix
+    meaningful = [
+        line
+        for line in lines
+        if line.strip() != "" and not line.lstrip(" \t").startswith("#")
+    ]
+    if meaningful:
+        raise CredentialsError(
+            f"refusing to write: {path} has no refs section and no version "
+            "line; this plugin only creates the version 1 layout"
+        )
+    version_line = f"version: {_DOCUMENT_VERSION}"
+    if not any(line.strip() for line in lines):
+        lines[:] = [version_line, f"{REFS_SECTION}:", entry_line]
+        return [version_line], []
+    prefix = [*lines, version_line]
+    lines.extend([version_line, f"{REFS_SECTION}:", entry_line])
+    return prefix, []
+
+
+def _after_refs_tail(lines: list[str], start: int) -> list[str]:
+    """Return the content after the refs block, ignoring separators.
+
+    Blank lines and comments between the refs block and the next section
+    carry no content, so a write that folds them into the block changes
+    nothing a parser sees.
+
+    :param lines: Document lines without their line endings.
+    :type lines: list[str]
+    :param start: One past the last line of the refs block.
+    :type start: int
+    :returns: The lines from the first content line onwards.
+    :rtype: list[str]
+    """
+    index = start
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if stripped == "" or stripped.startswith("#"):
+            index += 1
+            continue
+        break
+    return lines[index:]
+
+
+def _rewrite_reference(
+    text: str, path: Path, name: str, value: str
+) -> tuple[str, list[str], list[str]]:
+    """Rewrite or insert one refs entry and report the preserved bytes.
+
+    :param text: Raw document text.
+    :type text: str
+    :param path: Document path used in error messages.
+    :type path: pathlib.Path
+    :param name: Validated reference name.
+    :type name: str
+    :param value: New non-empty value.
+    :type value: str
+    :returns: The rewritten text and the lines preserved before and
+        after the refs section.
+    :rtype: tuple[str, list[str], list[str]]
+    :raises CredentialsError: When the document layout cannot be
+        updated.
+    """
+    lines, newline, trailing = _document_lines(text)
+    layout = _locate_refs(lines, path)
+    scalar = encode_scalar(value)
+    created_entry = f"{_ENTRY_INDENT}{name}: {scalar}"
+    if layout.kind == "block":
+        entries = parse_refs(lines, layout.start, layout.end, path)
+        preserved_prefix = list(lines[: layout.header])
+        preserved_suffix = list(lines[layout.end :])
+        indent = _entry_indent(lines, layout.start, layout.end)
+        entry_line = f"{indent}{name}: {scalar}"
+        if name in entries:
+            entry = entries[name]
+            lines[entry.first_line : entry.next_line] = [entry_line]
         else:
-            characters.append(character)
-    characters.append(DOUBLE_QUOTE)
-    return "".join(characters)
+            lines.insert(
+                _entry_insertion(lines, layout, entries),
+                entry_line,
+            )
+    elif layout.kind == "inline_empty":
+        preserved_prefix = list(lines[: layout.header])
+        preserved_suffix = list(lines[layout.end :])
+        header_line = lines[layout.header]
+        comment = header_line[len(strip_comment(header_line)) :]
+        lines[layout.header] = f"{REFS_SECTION}:" + comment
+        lines.insert(layout.header + 1, created_entry)
+    else:
+        preserved_prefix, preserved_suffix = _create_refs_section(
+            lines, path, layout, created_entry
+        )
+    rewritten = newline.join(lines)
+    if trailing or text == "":
+        rewritten += newline
+    return rewritten, preserved_prefix, preserved_suffix
+
+
+def _verify_rewrite(
+    rewritten: str,
+    path: Path,
+    expected: dict[str, str],
+    preserved_prefix: list[str],
+    preserved_suffix: list[str],
+) -> None:
+    """Verify that a rewrite changed only the entry it was asked to change.
+
+    :param rewritten: The complete next document text.
+    :type rewritten: str
+    :param path: Document path used in error messages.
+    :type path: pathlib.Path
+    :param expected: The refs mapping the rewrite must produce.
+    :type expected: dict[str, str]
+    :param preserved_prefix: Lines that must still precede the refs
+        section.
+    :type preserved_prefix: list[str]
+    :param preserved_suffix: Lines that must still follow the refs
+        section.
+    :type preserved_suffix: list[str]
+    :raises CredentialsError: When the edit would change unrelated
+        content.
+    """
+    lines, _, _ = _document_lines(rewritten)
+    layout = _locate_refs(lines, path)
+    if layout.kind != "block":
+        raise CredentialsError(
+            "refusing to write: the edit would not leave a refs block"
+        )
+    if preserved_prefix and lines[: layout.header] != preserved_prefix:
+        raise CredentialsError(
+            "refusing to write: the edit would change the document header"
+        )
+    if preserved_suffix and _after_refs_tail(lines, layout.end) != _after_refs_tail(
+        preserved_suffix, 0
+    ):
+        raise CredentialsError(
+            "refusing to write: the edit would change content after the refs block"
+        )
+    entries = parse_refs(lines, layout.start, layout.end, path)
+    actual = {name: entry.value for name, entry in entries.items()}
+    if actual != expected:
+        raise CredentialsError(
+            "refusing to write: the edit would change unrelated refs entries"
+        )
 
 
 def _document_fingerprint(path: Path) -> tuple[int, int, int]:
@@ -772,73 +629,9 @@ def _document_fingerprint(path: Path) -> tuple[int, int, int]:
     try:
         status = os.stat(path)
     except FileNotFoundError:
-        raise CredentialsError(f"credentials file not found: {path}") from None
+        raise DocumentNotFound(f"credentials file not found: {path}") from None
     except OSError as error:
         raise CredentialsError(
             f"cannot inspect {path}: {error.strerror or 'I/O error'}"
         ) from None
     return (status.st_mtime_ns, status.st_size, status.st_ino)
-
-
-def _write_atomic(path: Path, text: str) -> None:
-    """Replace the document with new text through an atomic rename.
-
-    The temporary file is created beside the document, written with
-    owner-only permission, flushed to disk and renamed over the target.
-    A failure leaves the previous document untouched.
-
-    :param path: Absolute document path.
-    :type path: pathlib.Path
-    :param text: Complete new document text.
-    :type text: str
-    :raises CredentialsError: When the document cannot be written.
-    """
-    directory = path.parent
-    descriptor = -1
-    temporary: str | None = None
-    try:
-        descriptor, temporary = tempfile.mkstemp(
-            prefix=f".{path.name}.", suffix=".tmp", dir=directory
-        )
-        os.fchmod(descriptor, _OWNER_ONLY_MODE)
-        handle = os.fdopen(descriptor, "w", encoding="utf-8", newline="")
-        descriptor = -1
-        with handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        temporary = None
-        _sync_directory(directory)
-    except OSError as error:
-        raise CredentialsError(
-            f"cannot write {path}: {error.strerror or 'I/O error'}"
-        ) from None
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        if temporary is not None:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
-
-
-def _sync_directory(directory: Path) -> None:
-    """Flush one directory entry when the platform supports it.
-
-    :param directory: Directory that received the renamed document.
-    :type directory: pathlib.Path
-    :returns: Nothing.
-    :rtype: None
-    """
-    try:
-        descriptor = os.open(directory, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(descriptor)
-    except OSError:
-        pass
-    finally:
-        os.close(descriptor)

@@ -12,7 +12,12 @@ import shlex
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from .credentials import CredentialsError, CredentialsStore, validate_reference_name
+from .credentials import (
+    CredentialsError,
+    CredentialsStore,
+    DocumentNotFound,
+    validate_reference_name,
+)
 from .masking import mask_value
 
 COMMAND_NAME = "cred"
@@ -20,8 +25,10 @@ COMMAND_NAME = "cred"
 
 USAGE = """Usage:
 /cred set <KEY> <VALUE> [--skip-confirm]
+/cred set <KEY> -- <VALUE>
 /cred read <KEY>
-/cred ok | /cred confirm"""
+/cred ok | /cred confirm
+/cred help"""
 """Short usage text for malformed invocations."""
 
 _MISSING_VALUE = "(not set)"
@@ -102,19 +109,27 @@ class CredentialCommandHandler:
     def _set(self, text: str, arguments: list[str]) -> dict[str, str]:
         skip_confirm = False
         positional: list[str] = []
+        end_of_options = False
         for argument in arguments:
-            if argument == "--skip-confirm":
-                if skip_confirm:
-                    raise _Usage("--skip-confirm was given more than once")
-                skip_confirm = True
-            elif argument.startswith("--"):
-                raise _Usage(f"unknown option {argument}")
-            else:
-                positional.append(argument)
+            if not end_of_options:
+                if argument == "--":
+                    end_of_options = True
+                    continue
+                if argument == "--skip-confirm":
+                    if skip_confirm:
+                        raise _Usage("--skip-confirm was given more than once")
+                    skip_confirm = True
+                    continue
+                if argument.startswith("--"):
+                    raise _Usage(f"unknown option {argument}")
+            positional.append(argument)
         if len(positional) < 2:
             raise _Usage("/cred set needs a reference name and a value")
         if len(positional) > 2:
-            raise _Usage("the value contains whitespace; quote it as one argument")
+            raise _Usage(
+                "the value contains whitespace; quote it as one argument, and "
+                "put -- before a value that starts with --"
+            )
         name, value = positional
         validate_reference_name(name)
         if value == "":
@@ -123,7 +138,10 @@ class CredentialCommandHandler:
             return self._apply(name, value)
         if self._pending is not None and self._pending.command == text:
             return self._apply(self._pending.name, self._pending.value)
-        current = self._store.peek_reference(name)
+        try:
+            current = self._store.peek_reference(name)
+        except DocumentNotFound:
+            current = None
         self._pending = _PendingUpdate(name=name, value=value, command=text)
         current_text = _MISSING_VALUE if current is None else mask_value(current)
         return _success(

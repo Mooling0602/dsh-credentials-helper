@@ -1,0 +1,14 @@
+{
+  "ALPHA": "simple-plain-value",
+  "BETA_PLAIN_WRAPPED": "correct horse battery staple xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "GAMMA_SINGLE_WRAPPED": "it's a stored oauth blob word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word",
+  "DELTA_DOUBLE_ESCAPED": "line \"quoted\" with tab\t and control\u0001 word word word word word word word word word word word word word word word word word word word word",
+  "EPSILON_LITERAL": "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n",
+  "ZETA_STRIPPED": "first line\nsecond line",
+  "ETA_KEEP": "kept\n\n\n",
+  "THETA_INDENTED": "first\n  indented\n",
+  "IOTA_LOOKALIKE": "true",
+  "KAPPA_NUMBERISH": "123",
+  "LAMBDA_HASH": "#not-a-comment",
+  "MU_SPACED": " padded "
+}
