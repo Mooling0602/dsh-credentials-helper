@@ -1,0 +1,19 @@
+[project]
+name = "dsh-credentials-helper"
+version = "0.1.0"
+description = "dsh-mloader plugin that reads and updates the harness credential references from a slash command."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = []
+
+[dependency-groups]
+dev = ["dsh-mloader-sdk", "docformatter", "ruff", "ty"]
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+dsh-mloader-sdk = { git = "https://github.com/Mooling0602/dsh-mloader-python-sdk" }

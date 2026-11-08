@@ -1,0 +1,14 @@
+{
+  "id": "dsh-credentials-helper",
+  "name": "Credentials Helper",
+  "version": "0.1.0",
+  "description": "Read and update the credential references in <DSH_HOME>/.credentials.yaml from the /cred command, with masked output and a confirmation step for writes.",
+  "backend": "python",
+  "entry": "entry.py",
+  "enabled": true,
+  "inject": [],
+  "timeouts": {
+    "startupMs": 10000,
+    "callMs": 15000
+  }
+}
