@@ -7,6 +7,11 @@
   "entry": "entry.py",
   "enabled": true,
   "inject": [],
+  "capabilities": {
+    "tools": false,
+    "events": false,
+    "effect": false
+  },
   "timeouts": {
     "startupMs": 10000,
     "callMs": 15000
