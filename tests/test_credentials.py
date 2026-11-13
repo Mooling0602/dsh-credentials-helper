@@ -305,5 +305,215 @@ class StoreTests(TemporaryDocumentTest):
         self.assertEqual(leftovers, [])
 
 
+class CheckReferenceTests(TemporaryDocumentTest):
+    """Tests for the lenient per-reference scan behind /cred check."""
+
+    def test_it_reports_a_valid_reference(self):
+        self.write_document('version: 1\nrefs:\n  ALPHA: "secret-value"\n')
+        scan = CredentialsStore(self.path).check_reference("ALPHA")
+        self.assertTrue(scan.exists)
+        self.assertEqual(scan.value, "secret-value")
+
+    def test_it_reports_an_absent_reference(self):
+        self.write_document(DOCUMENT)
+        scan = CredentialsStore(self.path).check_reference("MISSING")
+        self.assertFalse(scan.exists)
+        self.assertIsNone(scan.value)
+
+    def test_an_unusable_entry_is_present_without_a_value(self):
+        self.write_document(
+            "version: 1\nrefs:\n  OK: fine\n  NULLED: null\n"
+            "  BLANK:\n  NUMBER: 5\n  NESTED:\n    A: b\n"
+        )
+        store = CredentialsStore(self.path)
+        for name in ["NULLED", "BLANK", "NUMBER", "NESTED"]:
+            with self.subTest(name=name):
+                scan = store.check_reference(name)
+                self.assertTrue(scan.exists)
+                self.assertIsNone(scan.value)
+        self.assertEqual(store.check_reference("OK").value, "fine")
+
+    def test_a_wrapped_and_quoted_value_is_scanned_like_the_strict_parse(self):
+        self.write_document('version: 1\nrefs:\n  K: "a\n    b"\n')
+        self.assertEqual(CredentialsStore(self.path).check_reference("K").value, "a b")
+
+    def test_a_block_scalar_is_scanned(self):
+        self.write_document("version: 1\nrefs:\n  K: |\n    line one\n    line two\n")
+        scan = CredentialsStore(self.path).check_reference("K")
+        self.assertEqual(scan.value, "line one\nline two\n")
+
+    def test_a_duplicate_entry_is_still_refused(self):
+        self.write_document("version: 1\nrefs:\n  K: a\n  K: b\n")
+        with self.assertRaises(CredentialsError) as caught:
+            CredentialsStore(self.path).check_reference("K")
+        self.assertIn("more than once", str(caught.exception))
+
+    def test_a_flow_refs_mapping_is_still_refused(self):
+        self.write_document("version: 1\nrefs: {K: x}\n")
+        with self.assertRaises(CredentialsError):
+            CredentialsStore(self.path).check_reference("K")
+
+    def test_a_missing_document_raises(self):
+        with self.assertRaises(DocumentNotFound):
+            CredentialsStore(self.path).check_reference("K")
+
+    def test_a_tab_indented_block_is_refused(self):
+        self.write_document("version: 1\nrefs:\n\tK: a\n")
+        with self.assertRaises(CredentialsError) as caught:
+            CredentialsStore(self.path).check_reference("K")
+        self.assertIn("tab", str(caught.exception))
+
+    def test_the_scan_does_not_write(self):
+        self.write_document(DOCUMENT)
+        before = self.read_document()
+        CredentialsStore(self.path).check_reference("ALPHA")
+        self.assertEqual(self.read_document(), before)
+        self.assertFalse(self.lock_path().exists())
+
+
+class DeleteReferenceTests(TemporaryDocumentTest):
+    """Tests for deleting one reference from the document."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_document(DOCUMENT)
+
+    def store(self):
+        return CredentialsStore(self.path)
+
+    def test_a_delete_removes_only_its_entry(self):
+        self.assertTrue(self.store().delete_reference("ALPHA"))
+        text = self.read_document()
+        self.assertNotIn("ALPHA", text)
+        self.assertIn("BETA: 'single quoted'", text)
+        self.assertIn('GAMMA: "double quoted"', text)
+        self.assertIn("keep-me", text)
+
+    def test_deleting_an_absent_reference_changes_nothing(self):
+        before = self.read_document()
+        self.assertFalse(self.store().delete_reference("MISSING"))
+        self.assertEqual(self.read_document(), before)
+
+    def test_a_comment_above_an_entry_goes_with_it(self):
+        self.write_document("version: 1\nrefs:\n  # note A\n  A: a\n  B: b\n")
+        self.store().delete_reference("A")
+        self.assertEqual(self.read_document(), "version: 1\nrefs:\n  B: b\n")
+
+    def test_a_comment_separated_by_a_blank_line_stays(self):
+        self.write_document("version: 1\nrefs:\n  # section note\n\n  A: a\n  B: b\n")
+        self.store().delete_reference("A")
+        self.assertIn("# section note", self.read_document())
+
+    def test_deleting_the_last_reference_keeps_the_section(self):
+        self.write_document('version: 1\nrefs:\n  ONLY: "only"\n')
+        self.assertTrue(self.store().delete_reference("ONLY"))
+        text = self.read_document()
+        self.assertNotIn("only", text)
+        self.assertIn("refs:", text)
+
+    def test_a_multi_line_value_is_removed_whole(self):
+        self.write_document("version: 1\nrefs:\n  X: |\n    one\n    two\n  Y: y\n")
+        self.store().delete_reference("X")
+        text = self.read_document()
+        self.assertNotIn("one", text)
+        self.assertNotIn("two", text)
+        self.assertIn("Y: y", text)
+
+    def test_a_document_without_refs_reports_absent(self):
+        self.write_document("version: 1\nrecords:\n  a/b:\n    kind: api-key\n")
+        self.assertFalse(self.store().delete_reference("A"))
+        self.assertIn("records:", self.read_document())
+
+    def test_a_missing_document_reports_absent(self):
+        self.path.unlink()
+        self.assertFalse(self.store().delete_reference("A"))
+        self.assertFalse(self.path.exists())
+
+    def test_a_delete_rejects_a_malformed_name(self):
+        with self.assertRaises(CredentialsError):
+            self.store().delete_reference("1BAD")
+
+    def test_a_concurrent_change_aborts_the_delete(self):
+        original = self.read_document()
+        real_fingerprint = credentials._document_fingerprint
+        calls = {"count": 0}
+
+        def fingerprint(path):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return real_fingerprint(path)
+            return (0, 0, 0)
+
+        with (
+            mock.patch.object(credentials, "_document_fingerprint", fingerprint),
+            self.assertRaises(DocumentChanged),
+        ):
+            self.store().delete_reference("ALPHA")
+        self.assertEqual(self.read_document(), original)
+
+
+class DeleteReferencesTests(TemporaryDocumentTest):
+    """Tests for deleting several references in one pass."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_document(
+            "version: 1\nrefs:\n  A: a\n  B: b\n  C: c\nrecords:\n  s/i:\n    kind: api-key\n"
+        )
+
+    def store(self):
+        return CredentialsStore(self.path)
+
+    def test_a_batch_removes_every_named_entry(self):
+        removed = self.store().delete_references(["A", "C"])
+        self.assertEqual(removed, ["A", "C"])
+        text = self.read_document()
+        self.assertNotIn("A: a", text)
+        self.assertNotIn("C: c", text)
+        self.assertIn("B: b", text)
+
+    def test_a_batch_reports_only_the_names_that_were_present(self):
+        removed = self.store().delete_references(["A", "MISSING"])
+        self.assertEqual(removed, ["A"])
+
+    def test_a_batch_with_no_present_name_writes_nothing(self):
+        before = self.read_document()
+        self.assertEqual(self.store().delete_references(["X", "Y"]), [])
+        self.assertEqual(self.read_document(), before)
+
+    def test_a_batch_keeps_the_records_section(self):
+        self.store().delete_references(["A", "B", "C"])
+        text = self.read_document()
+        self.assertIn("records:", text)
+        self.assertIn("s/i:", text)
+        self.assertIn("refs:\n", text)
+
+    def test_a_batch_removes_comments_with_their_entries(self):
+        self.write_document(
+            "version: 1\nrefs:\n  # note A\n  A: a\n  # note B\n  B: b\n"
+        )
+        self.store().delete_references(["A", "B"])
+        self.assertEqual(self.read_document(), "version: 1\nrefs:\n")
+
+    def test_a_batch_rejects_a_malformed_name_before_writing(self):
+        before = self.read_document()
+        with self.assertRaises(CredentialsError):
+            self.store().delete_references(["A", "1BAD"])
+        self.assertEqual(self.read_document(), before)
+
+    def test_a_batch_of_no_names_writes_nothing(self):
+        before = self.read_document()
+        self.assertEqual(self.store().delete_references([]), [])
+        self.assertEqual(self.read_document(), before)
+
+    def test_the_names_come_back_in_document_order(self):
+        self.assertEqual(self.store().reference_names(), ["A", "B", "C"])
+
+    def test_names_of_a_missing_document_raise(self):
+        self.path.unlink()
+        with self.assertRaises(DocumentNotFound):
+            self.store().reference_names()
+
+
 if __name__ == "__main__":
     unittest.main()

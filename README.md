@@ -39,10 +39,21 @@ python3 <dsh-mloader>/src/runtime/python_sdk/run_cli.py pack src -o dist/dsh-cre
 | `/cred set <KEY> <VALUE> --skip-confirm` | Write the update immediately. |
 | `/cred set <KEY> -- <VALUE>` | Stage one update whose value starts with `--`. |
 | `/cred read <KEY>` | Print the decoded value of `KEY`. |
-| `/cred ok` or `/cred confirm` | Write the update that is waiting for confirmation. |
+| `/cred check <KEY>` | Report whether `KEY` exists and carries a usable value, masked. |
+| `/cred remove <KEY>` | Stage the deletion of `KEY` and ask for confirmation. |
+| `/cred remove <PATTERN>` | Stage the deletion of every reference matching `*`/`?` and list them all. |
+| `/cred ok` or `/cred confirm` | Write the update or deletion that is waiting for confirmation. |
 | `/cred help` | Show the usage text. |
 
 `KEY` is a credential reference name, the same environment-variable-style name the Harness uses inside `refs` (`[A-Za-z_][A-Za-z0-9_]*`). `VALUE` is one argument, so quote a value that contains spaces and put `--` before a value that starts with two dashes. A new `KEY` is added to the `refs` mapping; an existing key keeps its position.
+
+`/cred check` replaces a read failure with three answers: the key is absent, the key exists with a usable value, or the key exists with an unusable one (missing, empty, `null` or not a string). The third answer prints `<null>` and never echoes the stored text; the other two still mask a valid value. A document that cannot be read or parsed at all is still an error, because then no entry can be described.
+
+`/cred remove` deletes entries and always takes the confirmation step: `--skip-confirm` is refused, because a deleted credential cannot be recovered from this command. The target may name one reference or use the wildcards `*` (any run of characters) and `?` (exactly one); everything else is literal, and a target without wildcards has to match a whole name, so `A.B` is refused as a malformed name instead of matching `AXB`.
+
+The prompt lists every reference about to go, each with its masked current value, and nothing is written until `/cred ok`, `/cred confirm` or an identical repeat of the command. A `*` target is the widest delete the command can express and still takes confirmation, so it lists every key before anything happens. Removing references that are already absent writes nothing and says so. Each entry goes whole, including a multi-line value and the comment block written directly above it, which the harness reads as that entry's note; a comment separated from the entry by a blank line stays. Deleting every reference leaves the bare `refs:` header in place, so the section stays addressable.
+
+One confirmation covers the whole list and the document is read and locked once, so a listing the operator approved cannot half-apply against a file something else changed in between.
 
 ## Confirmation
 
@@ -56,7 +67,9 @@ A different `/cred set` replaces the pending update. When the document does not 
 
 ## Masking and output
 
-Every message except `/cred read` shows a masked value: nothing for twelve characters or fewer; a longer value shows a three- or four-character prefix and suffix, never more than half of it. `/cred read` prints the decoded value because that is its purpose. Error messages never include a decoded value, and a parse error reports only the document path and a line number, never the offending text.
+Every message except `/cred read` shows a masked value: nothing for twelve characters or fewer; a longer value shows a three- or four-character prefix and suffix, never more than half of it. `/cred read` prints the decoded value because that is its purpose, and `/cred check` reads a value only to decide between its three answers. Error messages never include a decoded value, and a parse error reports only the document path and a line number, never the offending text.
+
+An error built from two clauses is sent as two lines, split between them rather than at a column width. The chat client shows a command outcome as a one-line summary that elides and only offers the disclosure body when the text contains a newline, so the second clause would otherwise be cut off with no way to read it; the client wraps a merely-wide line on its own, so folding the text here would break it at an arbitrary point and fight that wrapping. Usage text already spans several lines and is left alone.
 
 ## Where the document lives
 

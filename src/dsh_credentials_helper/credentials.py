@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,10 +36,12 @@ from ._yaml import (
     KEY_PATTERN,
     LF,
     RefEntry,
+    RefScan,
     encode_scalar,
     leading_whitespace,
     line_error,
     parse_refs,
+    scan_reference,
     strip_comment,
 )
 from .paths import resolve_credentials_path
@@ -67,6 +70,7 @@ __all__ = [
     "CredentialsStore",
     "DocumentChanged",
     "DocumentNotFound",
+    "RefScan",
     "ReferenceNotFound",
     "validate_reference_name",
 ]
@@ -132,6 +136,30 @@ class CredentialsStore:
         _, refs = _load_document(path)
         return refs.get(name)
 
+    def check_reference(self, name: str) -> RefScan:
+        """Report the presence and validity of one reference.
+
+        Unlike :meth:`peek_reference`, an entry the strict parser refuses
+        does not abort the answer: the reference is reported as present
+        with no usable value. A document that cannot be read or parsed
+        at all still raises, because then no entry can be described.
+
+        :param name: Reference name.
+        :type name: str
+        :returns: Whether the reference exists and, when it does, its
+            usable value.
+        :rtype: RefScan
+        :raises CredentialsError: When the name or the document is
+            invalid.
+        """
+        validate_reference_name(name)
+        path = self.path
+        _, lines, _, _ = _read_document(path)
+        layout = _locate_refs(lines, path)
+        if layout.kind != "block":
+            return RefScan(exists=False, value=None)
+        return scan_reference(lines, layout.start, layout.end, path, name)
+
     def set_reference(self, name: str, value: str) -> bool:
         """Write one reference, preserving the rest of the document.
 
@@ -180,6 +208,91 @@ class CredentialsStore:
                 )
             write_atomic(path, rewritten)
             return True
+
+    def reference_names(self) -> list[str]:
+        """Return the reference names the document declares, in order.
+
+        The names come from the same strict parse the rest of the store
+        uses, so a document this plugin cannot read raises instead of
+        reporting a partial list the operator might delete from.
+
+        :returns: Reference names in document order.
+        :rtype: list[str]
+        :raises CredentialsError: When the document is invalid.
+        """
+        path = self.path
+        _, refs = _load_document(path)
+        return list(refs)
+
+    def delete_reference(self, name: str) -> bool:
+        """Delete one reference, preserving the rest of the document.
+
+        :param name: Reference name.
+        :type name: str
+        :returns: True when the document was written, False when the
+            reference was already absent.
+        :rtype: bool
+        :raises CredentialsError: When the name or the document is
+            invalid, when the edit would change unrelated content, or
+            when the writer lock cannot be taken.
+        """
+        return bool(self.delete_references([name]))
+
+    def delete_references(self, names: Sequence[str]) -> list[str]:
+        """Delete several references in one locked pass.
+
+        The whole entry goes, including a wrapped or block scalar, the
+        blank lines inside it, and the comment written directly above
+        it. Deleting every reference leaves the bare section header, so
+        the section stays addressable without a stub entry.
+
+        Deleting in one pass matters beyond speed: the document is read
+        and verified once, so a confirmation the operator gave against
+        one listing cannot half-apply against a document an external
+        writer changed in between.
+
+        :param names: Reference names to delete.
+        :type names: Sequence[str]
+        :returns: The names that were present and removed, in
+            document order.
+        :rtype: list[str]
+        :raises CredentialsError: When a name or the document is
+            invalid, when the edit would change unrelated content, or
+            when the writer lock cannot be taken.
+        """
+        for name in names:
+            validate_reference_name(name)
+        if not names:
+            return []
+        path = self.path
+        with document_lock(path):
+            if not path.exists():
+                return []
+            fingerprint = _document_fingerprint(path)
+            text, lines, _, _ = _read_document(path)
+            layout = _locate_refs(lines, path)
+            if layout.kind != "block":
+                return []
+            entries = parse_refs(lines, layout.start, layout.end, path)
+            doomed = [name for name in names if name in entries]
+            if not doomed:
+                return []
+            expected = {key: item.value for key, item in entries.items()}
+            for name in doomed:
+                del expected[name]
+            rewritten, preserved_prefix, preserved_suffix = _remove_references(
+                text, path, [entries[name] for name in doomed]
+            )
+            _verify_rewrite(
+                rewritten, path, expected, preserved_prefix, preserved_suffix
+            )
+            if _document_fingerprint(path) != fingerprint:
+                raise DocumentChanged(
+                    "the credentials file changed while the update was "
+                    "being prepared; run the command again"
+                )
+            write_atomic(path, rewritten)
+            return [name for name in entries if name in set(doomed)]
 
 
 def validate_reference_name(name: str) -> None:
@@ -567,6 +680,74 @@ def _rewrite_reference(
     if trailing or text == "":
         rewritten += newline
     return rewritten, preserved_prefix, preserved_suffix
+
+
+def _remove_references(
+    text: str, path: Path, entries: Sequence[RefEntry]
+) -> tuple[str, list[str], list[str]]:
+    """Remove refs entries and report the preserved bytes.
+
+    A comment block written directly above an entry annotates that
+    entry, so deleting it removes the comment too; leaving the comment
+    behind would attach it to whichever entry followed. Entries are
+    removed from the bottom up so an earlier removal never shifts the
+    line range a later one still refers to.
+
+    :param text: Raw document text.
+    :type text: str
+    :param path: Document path used in error messages.
+    :type path: pathlib.Path
+    :param entries: The parsed entries to remove.
+    :type entries: Sequence[RefEntry]
+    :returns: The rewritten text and the lines preserved before and
+        after the refs section.
+    :rtype: tuple[str, list[str], list[str]]
+    :raises CredentialsError: When the document layout cannot be
+        updated.
+    """
+    lines, newline, trailing = _document_lines(text)
+    layout = _locate_refs(lines, path)
+    if layout.kind != "block":
+        raise CredentialsError(
+            "refusing to write: the reference is not inside a refs block"
+        )
+    preserved_prefix = list(lines[: layout.header])
+    preserved_suffix = list(lines[layout.end :])
+    spans = [
+        (_annotation_start(lines, layout.start, entry.first_line), entry.next_line)
+        for entry in entries
+    ]
+    for start, stop in sorted(spans, reverse=True):
+        lines[start:stop] = []
+    rewritten = newline.join(lines)
+    if trailing or text == "":
+        rewritten += newline
+    return rewritten, preserved_prefix, preserved_suffix
+
+
+def _annotation_start(lines: list[str], start: int, first_line: int) -> int:
+    """Return the first line of the note written above one entry.
+
+    A comment block immediately above an entry annotates that entry, the
+    way the harness reads it, so removing the entry removes the note
+    too. Leaving it behind would move the note onto whichever entry
+    followed, which reads as an annotation of a credential nobody wrote
+    it for. A blank line ends the note, so a comment separated from the
+    entry stays with the section.
+
+    :param lines: Document lines without their line endings.
+    :type lines: list[str]
+    :param start: First line of the refs block.
+    :type start: int
+    :param first_line: Line of the entry about to be removed.
+    :type first_line: int
+    :returns: The index to start removing from.
+    :rtype: int
+    """
+    index = first_line
+    while index > start and lines[index - 1].strip().startswith("#"):
+        index -= 1
+    return index
 
 
 def _verify_rewrite(

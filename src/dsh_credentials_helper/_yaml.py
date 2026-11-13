@@ -177,6 +177,132 @@ def parse_refs(
     return entries
 
 
+@dataclass(frozen=True)
+class RefScan:
+    """Presence and validity of one reference, reported without raising.
+
+    :param exists: True when the refs block declares the reference.
+    :type exists: bool
+    :param value: The decoded value when it is a usable non-empty
+        string, or None when the reference is absent or its entry
+        carries a value the strict parser refuses.
+    :type value: str | None
+    """
+
+    exists: bool
+    value: str | None
+
+
+def scan_reference(
+    lines: list[str],
+    start: int,
+    end: int,
+    path: Path,
+    name: str,
+) -> RefScan:
+    """Report whether one reference exists and carries a usable value.
+
+    The scan applies the same indentation rules as the strict parser, so
+    a block that parser would refuse is refused here too. The difference
+    is the value: an entry whose scalar is missing, empty or not a
+    string is reported as present-but-unusable instead of aborting the
+    whole block. That is what lets the check subcommand name the state
+    of one reference in a document whose neighbour is unusable.
+
+    :param lines: Document lines without their line endings.
+    :type lines: list[str]
+    :param start: First line of the refs block.
+    :type start: int
+    :param end: One past the last line of the refs block.
+    :type end: int
+    :param path: Document path used in error messages.
+    :type path: pathlib.Path
+    :param name: Reference name to look for.
+    :type name: str
+    :returns: The presence and validity of that reference.
+    :rtype: RefScan
+    :raises CredentialsError: When the block is not a mapping of
+        strings, or the reference is declared more than once.
+    """
+    indent = ""
+    matches: list[tuple[int, str, int]] = []
+    index = start
+    while index < end:
+        line = lines[index]
+        stripped = line.strip()
+        if stripped == "" or stripped.startswith(HASH):
+            index += 1
+            continue
+        leading = leading_whitespace(line)
+        if TAB in leading:
+            raise line_error(
+                path,
+                index,
+                "the refs entry is indented with a tab; YAML indentation must "
+                "use spaces",
+            )
+        if indent == "":
+            if leading == "":
+                raise line_error(path, index, "the refs entry is not indented")
+            indent = leading
+        if leading != indent:
+            index += 1
+            continue
+        match = KEY_PATTERN.match(line[len(indent) :])
+        if match is None:
+            raise line_error(path, index, "the refs entry is not a plain string key")
+        key, raw = match.group(1), match.group(2).lstrip(_INDENT_CHARACTERS)
+        next_index = _next_entry_line(lines, index, end, indent)
+        if key == name:
+            matches.append((index, raw, next_index))
+        index = next_index
+    if not matches:
+        return RefScan(exists=False, value=None)
+    if len(matches) > 1:
+        raise line_error(
+            path, matches[1][0], f'reference "{name}" is declared more than once'
+        )
+    entry_index, raw, entry_end = matches[0]
+    try:
+        value, _ = _parse_value(lines, entry_index, entry_end, indent, raw, path)
+    except CredentialsError:
+        return RefScan(exists=True, value=None)
+    if value == "":
+        return RefScan(exists=True, value=None)
+    return RefScan(exists=True, value=value)
+
+
+def _next_entry_line(lines: list[str], index: int, end: int, indent: str) -> int:
+    """Return the line where the block entry that starts at one index ends.
+
+    Blank lines and comments stay inside the entry, while the first
+    content line indented no deeper than the entry starts the next entry
+    or leaves the block.
+
+    :param lines: Document lines without their line endings.
+    :type lines: list[str]
+    :param index: Index of the entry's first line.
+    :type index: int
+    :param end: One past the last line of the refs block.
+    :type end: int
+    :param indent: Indentation of the entry line.
+    :type indent: str
+    :returns: The index one past the entry's last line.
+    :rtype: int
+    """
+    cursor = index + 1
+    while cursor < end:
+        line = lines[cursor]
+        stripped = line.strip()
+        if stripped == "" or stripped.startswith(HASH):
+            cursor += 1
+            continue
+        if len(leading_whitespace(line)) <= len(indent):
+            return cursor
+        cursor += 1
+    return end
+
+
 def encode_scalar(value: str) -> str:
     """Render one string as a single-line YAML double-quoted scalar.
 

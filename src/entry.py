@@ -35,7 +35,7 @@ def apply(ctx: Context) -> None:
         names=(COMMAND_NAME, "credentials"),
         node_id=COMMAND_NAME,
         description="Read a credential reference, or update one with a confirmation step.",
-        input_hint="set <KEY> <VALUE> [--skip-confirm] | read <KEY> | ok",
+        input_hint="set <KEY> <VALUE> [--skip-confirm] | read <KEY> | check <KEY> | remove <KEY|PATTERN> | ok",
     )
     def credential_command(raw_input: str) -> dict[str, str]:
         """Dispatch one /cred invocation.
